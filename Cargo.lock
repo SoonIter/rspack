@@ -4173,6 +4173,7 @@ name = "rspack_plugin_asset"
 version = "0.2.0"
 dependencies = [
  "async-trait",
+ "cow-utils",
  "mime_guess",
  "rayon",
  "rspack_base64",

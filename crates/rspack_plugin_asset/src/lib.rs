@@ -3,10 +3,12 @@
 use std::{borrow::Cow, hash::Hasher, path::PathBuf};
 
 use async_trait::async_trait;
+use cow_utils::CowUtils;
 use rayon::prelude::*;
 use rspack_cacheable::{cacheable, cacheable_dyn};
 use rspack_core::{
-  rspack_sources::{BoxSource, RawBufferSource, RawStringSource, SourceExt},
+  get_js_chunk_filename_template,
+  rspack_sources::{BoxSource, CachedSource, RawBufferSource, RawStringSource, SourceExt},
   AssetGeneratorDataUrl, AssetGeneratorDataUrlFnCtx, AssetInfo, AssetParserDataUrl,
   BuildMetaDefaultObject, BuildMetaExportsType, ChunkGraph, ChunkUkey, CodeGenerationDataAssetInfo,
   CodeGenerationDataFilename, CodeGenerationDataUrl, Compilation, CompilationRenderManifest,
@@ -19,6 +21,8 @@ use rspack_error::{error, Diagnostic, IntoTWithDiagnosticArray, Result};
 use rspack_hash::{RspackHash, RspackHashDigest};
 use rspack_hook::{plugin, plugin_hook};
 use rspack_util::{ext::DynHash, identifier::make_paths_relative};
+
+pub const AUTO_PUBLIC_PATH_PLACEHOLDER: &str = "__RSPACK_PLUGIN_ASSET_AUTO_PUBLIC_PATH__";
 
 #[plugin]
 #[derive(Debug, Default)]
@@ -432,7 +436,6 @@ impl ParserAndGenerator for AssetParserAndGenerator {
         let exported_content = if parsed_asset_config.is_inline() {
           let resource_data: &ResourceData = normal_module.resource_resolved_data();
           let data_url = module_generator_options.and_then(|x| x.asset_data_url());
-
           let encoded_source: String;
 
           if let Some(custom_data_url) =
@@ -522,8 +525,70 @@ impl ParserAndGenerator for AssetParserAndGenerator {
         } else {
           unreachable!()
         };
+
+        let experimental_lib_preserve_import = module_generator_options
+          .and_then(|x| x.get_asset())
+          .and_then(|x| x.experimental_lib_preserve_import)
+          .or_else(|| {
+            module_generator_options
+              .and_then(|x| x.get_asset_resource())
+              .and_then(|x| x.experimental_lib_preserve_import)
+          })
+          .unwrap_or(false);
+        let experimental_lib_re_export = module_generator_options
+          .and_then(|x| x.get_asset())
+          .and_then(|x| x.experimental_lib_re_export)
+          .or_else(|| {
+            module_generator_options
+              .and_then(|x| x.get_asset_resource())
+              .and_then(|x| x.experimental_lib_re_export)
+          })
+          .unwrap_or(false);
+
+        if experimental_lib_preserve_import || experimental_lib_re_export {
+          if module_generator_options.and_then(|x| x.asset_public_path()) {
+            if let Some(ref mut scope) = generate_context.concatenation_scope {
+              scope.register_namespace_export(NAMESPACE_OBJECT_EXPORT);
+              dbg!(&exported_content);
+              return Ok(if experimental_lib_re_export {
+                //               RawStringSource::from(format!(
+                //                 r#"import {NAMESPACE_OBJECT_EXPORT} from {exported_content};
+                // export default {NAMESPACE_OBJECT_EXPORT};"#
+                //               ))
+                RawStringSource::from(format!(
+                r#"const {NAMESPACE_OBJECT_EXPORT} = new URL({exported_content}, import.meta.url).href;
+export default {NAMESPACE_OBJECT_EXPORT};"#
+              ))
+              .boxed()
+              } else {
+                RawStringSource::from(format!(
+                  r#"import {NAMESPACE_OBJECT_EXPORT} from {exported_content};"#
+                ))
+                .boxed()
+              });
+            } else {
+              generate_context
+                .runtime_requirements
+                .insert(RuntimeGlobals::MODULE);
+              return Ok(
+                RawStringSource::from(format!(
+                  r#"const __rslib_import_meta_url__ = /*#__PURE__*/ (function () {{
+  return typeof document === 'undefined'
+    ? new (require('url'.replace('', '')).URL)('file:' + __filename).href
+    : (document.currentScript && document.currentScript.src) ||
+      new URL('main.js', document.baseURI).href;
+}})();
+module.exports = new URL({exported_content}, __rslib_import_meta_url__).href;"#
+                ))
+                .boxed(),
+              );
+            }
+          };
+        }
+
         if let Some(ref mut scope) = generate_context.concatenation_scope {
           scope.register_namespace_export(NAMESPACE_OBJECT_EXPORT);
+          dbg!(&exported_content);
           let supports_const = compilation.options.output.environment.supports_const();
           let declaration_kind = if supports_const { "const" } else { "var" };
           Ok(
@@ -617,7 +682,7 @@ async fn render_manifest(
   compilation: &Compilation,
   chunk_ukey: &ChunkUkey,
   manifest: &mut Vec<RenderManifestEntry>,
-  _diagnostics: &mut Vec<Diagnostic>,
+  diagnostics: &mut Vec<Diagnostic>,
 ) -> Result<()> {
   let chunk = compilation.chunk_by_ukey.expect_get(chunk_ukey);
   let module_graph = compilation.get_module_graph();
@@ -663,7 +728,76 @@ async fn render_manifest(
     .collect::<Vec<RenderManifestEntry>>();
 
   manifest.extend(assets);
+
+  // let (source, more_diagnostics) = compilation
+  //   .old_cache
+  //   .chunk_render_occasion
+  //   .use_cache(compilation, chunk, &SourceType::JavaScript, || async {
+  //     let source = render_chunk(compilation, chunk_ukey).await?;
+  //     Ok((CachedSource::new(source).boxed(), Vec::new()))
+  //   })
+  //   .await?;
+
+  // diagnostics.extend(more_diagnostics);
+  // manifest.push(RenderManifestEntry {
+  //   source: source.boxed(),
+  //   filename: output_path,
+  //   has_filename: false,
+  //   info: asset_info,
+  //   auxiliary: false,
+  // });
+
   Ok(())
+}
+
+pub async fn render_chunk(compilation: &Compilation, chunk_ukey: &ChunkUkey) -> Result<BoxSource> {
+  let chunk = compilation.chunk_by_ukey.expect_get(chunk_ukey);
+  let module_graph = compilation.get_module_graph();
+  let chunk_graph = &compilation.chunk_graph;
+
+  let ordered_modules =
+    chunk_graph.get_chunk_modules_by_source_type(chunk_ukey, SourceType::JavaScript, &module_graph);
+
+  let mut source = String::new();
+  for module in ordered_modules {
+    let code_gen_result = compilation
+      .code_generation_results
+      .get(&module.identifier(), Some(chunk.runtime()));
+
+    let result = code_gen_result
+      .get(&SourceType::JavaScript)
+      .map(|source| source.source());
+    source += &result.unwrap_or_default();
+  }
+  let filename_template = get_js_chunk_filename_template(
+    chunk,
+    &compilation.options.output,
+    &compilation.chunk_group_by_ukey,
+  );
+
+  let mut asset_info = AssetInfo::default();
+  let output_path = compilation.get_path_with_info(
+    &filename_template,
+    PathData::default()
+      .chunk_id_optional(chunk.id(&compilation.chunk_ids).map(|id| id.as_str()))
+      .chunk_hash_optional(chunk.rendered_hash(
+        &compilation.chunk_hashes_results,
+        compilation.options.output.hash_digest_length,
+      ))
+      .chunk_name_optional(chunk.name_for_filename_template(&compilation.chunk_ids))
+      .content_hash_optional(chunk.rendered_content_hash_by_source_type(
+        &compilation.chunk_hashes_results,
+        &SourceType::Css,
+        compilation.options.output.hash_digest_length,
+      ))
+      .runtime(chunk.runtime().as_str()),
+    &mut asset_info,
+  )?;
+
+  let undo_path = PublicPath::render_auto_public_path(compilation, &output_path);
+  source.cow_replace(AUTO_PUBLIC_PATH_PLACEHOLDER, &undo_path);
+
+  Ok(RawStringSource::from(source).boxed())
 }
 
 #[async_trait]
@@ -700,6 +834,12 @@ impl Plugin for AssetPlugin {
         ))
       }),
     );
+
+    ctx
+      .context
+      .compilation_hooks
+      .render_manifest
+      .tap(render_manifest::new(self));
 
     ctx.context.register_parser_and_generator_builder(
       rspack_core::ModuleType::AssetInline,
